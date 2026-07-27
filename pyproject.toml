@@ -8,6 +8,7 @@ dependencies = [
     "thinharness[tracing]",
     "pydantic>=2",
     "litellm>=1.80.0",
+    "logfire[litellm]>=4.16.0",
     "numpy>=2",
 ]
 

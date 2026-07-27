@@ -3,10 +3,37 @@
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any
 
 from thinharness import ModelSettings, OpenAIProvider, OpenAIResponsesModel, Provider, parse_model_ref
 from thinharness.providers import ProviderError
+
+_instrumentation_lock = threading.Lock()
+_instrumentation_enabled = False
+
+
+def configure_litellm_instrumentation() -> bool:
+    """Enable Logfire's LiteLLM inference spans once when a token is configured."""
+    global _instrumentation_enabled
+
+    token = os.getenv("LOGFIRE_TOKEN", "").strip()
+    if not token:
+        return False
+    with _instrumentation_lock:
+        if _instrumentation_enabled:
+            return True
+        import logfire
+
+        logfire.configure(
+            token=token,
+            service_name="retrodict-litellm",
+            send_to_logfire=True,
+            console=False,
+        )
+        logfire.instrument_litellm()
+        _instrumentation_enabled = True
+    return True
 
 
 def litellm_model_name(model_ref: str) -> str:

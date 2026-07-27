@@ -141,8 +141,9 @@ class ThinAgentClient:
     ) -> None:
         from thinharness import Harness, HarnessConfig, TracingOptions, create_otlp_tracing
 
-        from .litellm_provider import build_litellm_model
+        from .litellm_provider import build_litellm_model, configure_litellm_instrumentation
 
+        configure_litellm_instrumentation()
         self.logfire_tracing = logfire_tracing
         self._owns_logfire_tracing = False
         remote_tracing = []

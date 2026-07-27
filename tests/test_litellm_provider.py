@@ -5,12 +5,37 @@ from types import SimpleNamespace
 import pytest
 from thinharness.providers import ProviderError
 
-from arc3.litellm_provider import LiteLLMResponsesProvider, build_litellm_model, litellm_model_name
+from arc3 import litellm_provider
+from arc3.litellm_provider import (
+    LiteLLMResponsesProvider,
+    build_litellm_model,
+    configure_litellm_instrumentation,
+    litellm_model_name,
+)
 
 
 def test_litellm_model_name_translates_harness_provider_separator() -> None:
     assert litellm_model_name("openai:gpt-5.5") == "openai/gpt-5.5"
     assert litellm_model_name("openrouter:moonshotai/kimi-k2.6") == "openrouter/moonshotai/kimi-k2.6"
+
+
+def test_logfire_litellm_instrumentation_is_enabled_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setenv("LOGFIRE_TOKEN", "logfire-test-token")
+    monkeypatch.setattr(litellm_provider, "_instrumentation_enabled", False)
+    monkeypatch.setattr("logfire.configure", lambda **kwargs: calls.append(("configure", kwargs)))
+    monkeypatch.setattr("logfire.instrument_litellm", lambda: calls.append(("instrument", None)))
+
+    assert configure_litellm_instrumentation() is True
+    assert configure_litellm_instrumentation() is True
+
+    assert [name for name, _ in calls] == ["configure", "instrument"]
+    configure_kwargs = calls[0][1]
+    assert isinstance(configure_kwargs, dict)
+    assert configure_kwargs["service_name"] == "retrodict-litellm"
+    assert configure_kwargs["send_to_logfire"] is True
 
 
 @pytest.mark.asyncio
