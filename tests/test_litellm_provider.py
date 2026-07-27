@@ -29,7 +29,10 @@ def test_logfire_litellm_instrumentation_is_enabled_once(
     monkeypatch.setenv("LOGFIRE_TOKEN", "logfire-test-token")
     monkeypatch.setattr(litellm_provider, "_instrumentation_enabled", False)
     monkeypatch.setattr("logfire.configure", lambda **kwargs: calls.append(("configure", kwargs)))
-    monkeypatch.setattr("logfire.instrument_litellm", lambda: calls.append(("instrument", None)))
+    monkeypatch.setattr(
+        "logfire.instrument_litellm",
+        lambda **kwargs: calls.append(("instrument", kwargs)),
+    )
 
     assert configure_litellm_instrumentation() is True
     assert configure_litellm_instrumentation() is True
@@ -40,6 +43,13 @@ def test_logfire_litellm_instrumentation_is_enabled_once(
     assert configure_kwargs["service_name"] == "retrodict-litellm"
     assert configure_kwargs["send_to_logfire"] == "if-token-present"
     assert configure_kwargs["distributed_tracing"] is True
+    instrumentation_kwargs = calls[1][1]
+    assert isinstance(instrumentation_kwargs, dict)
+    trace_config = instrumentation_kwargs["config"]
+    assert trace_config.hide_input_messages is True
+    assert trace_config.hide_output_messages is True
+    assert trace_config.hide_inputs is False
+    assert trace_config.hide_outputs is False
 
 
 @pytest.mark.asyncio
@@ -120,6 +130,7 @@ async def test_provider_routes_chat_completion_through_litellm(monkeypatch: pyte
         "messages": messages,
         "reasoning_effort": "high",
         "timeout": 42,
+        "_skip_responses_api_bridge": True,
         "api_key": "test-key",
         "api_base": "https://gateway.example/v1",
     }

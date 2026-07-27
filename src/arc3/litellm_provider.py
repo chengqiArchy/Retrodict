@@ -32,6 +32,7 @@ def configure_litellm_instrumentation() -> bool:
         if _instrumentation_enabled:
             return True
         import logfire
+        from openinference.instrumentation import TraceConfig
 
         logfire.configure(
             token=token,
@@ -41,7 +42,12 @@ def configure_litellm_instrumentation() -> bool:
             distributed_tracing=True,
             console=False,
         )
-        logfire.instrument_litellm()
+        logfire.instrument_litellm(
+            config=TraceConfig(
+                hide_input_messages=True,
+                hide_output_messages=True,
+            )
+        )
         _instrumentation_enabled = True
     return True
 
@@ -158,7 +164,16 @@ class LiteLLMChatCompletionsProvider(OpenRouterProvider):
         """Call LiteLLM completion while preserving ThinHarness' full message history."""
         from litellm import completion
 
-        request = {**payload, "model": self.model_name, "timeout": self.timeout}
+        request = {
+            **payload,
+            "model": self.model_name,
+            "timeout": self.timeout,
+            # Some model metadata marks GPT-5 variants as Responses-only, which
+            # makes LiteLLM silently bridge completion() to responses(). This
+            # proxy supports Chat Completions, so keep the requested transport
+            # and the full message history intact.
+            "_skip_responses_api_bridge": True,
+        }
         reasoning = request.pop("reasoning", None)
         if isinstance(reasoning, dict) and reasoning.get("effort"):
             request["reasoning_effort"] = reasoning["effort"]
