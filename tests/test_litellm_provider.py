@@ -43,11 +43,11 @@ def test_logfire_litellm_instrumentation_is_enabled_once(
 async def test_provider_routes_responses_payload_through_litellm(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
-    async def fake_aresponses(**kwargs: object) -> object:
+    def fake_responses(**kwargs: object) -> object:
         captured.update(kwargs)
         return SimpleNamespace(model_dump=lambda **_: {"id": "resp_1", "output": []})
 
-    monkeypatch.setattr("litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("litellm.responses", fake_responses)
     provider = LiteLLMResponsesProvider(
         "openai:gpt-5.5",
         api_key="test-key",
@@ -71,11 +71,11 @@ async def test_provider_routes_responses_payload_through_litellm(monkeypatch: py
 async def test_openrouter_responses_sets_endpoint_and_auth_header(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
-    async def fake_aresponses(**kwargs: object) -> object:
+    def fake_responses(**kwargs: object) -> object:
         captured.update(kwargs)
         return {"id": "resp_1", "output": []}
 
-    monkeypatch.setattr("litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("litellm.responses", fake_responses)
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-openrouter-test-key")
     provider = LiteLLMResponsesProvider("openrouter:openai/gpt-5.5")
 
@@ -128,10 +128,10 @@ async def test_provider_maps_litellm_errors_to_harness_errors(monkeypatch: pytes
     class FakeLiteLLMError(Exception):
         status_code = 429
 
-    async def fail(**_: object) -> object:
+    def fail(**_: object) -> object:
         raise FakeLiteLLMError("rate limited")
 
-    monkeypatch.setattr("litellm.aresponses", fail)
+    monkeypatch.setattr("litellm.responses", fail)
     provider = LiteLLMResponsesProvider("openai:gpt-5.5")
 
     with pytest.raises(ProviderError, match="LiteLLM request failed: rate limited") as caught:

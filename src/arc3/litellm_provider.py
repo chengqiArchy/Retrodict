@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 from typing import Any
@@ -92,7 +93,7 @@ class LiteLLMResponsesProvider(OpenAIProvider):
 
     async def create_response(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Call LiteLLM and normalize its typed response for ThinHarness."""
-        from litellm import aresponses
+        from litellm import responses
 
         request = {**payload, "model": self.model_name, "timeout": self.timeout}
         if self.api_key:
@@ -102,7 +103,11 @@ class LiteLLMResponsesProvider(OpenAIProvider):
         if self.base_url:
             request["api_base"] = self.base_url
         try:
-            response = await aresponses(**request)
+            # LiteLLM's aresponses currently dispatches through a worker thread
+            # itself, then leaves its async success callback pending at loop
+            # shutdown. Run the synchronous API in our worker instead so the
+            # event loop remains non-blocking and instrumentation fully flushes.
+            response = await asyncio.to_thread(responses, **request)
         except Exception as exc:
             status_code = getattr(exc, "status_code", None)
             raise ProviderError(f"LiteLLM request failed: {exc}", status_code=status_code) from exc
