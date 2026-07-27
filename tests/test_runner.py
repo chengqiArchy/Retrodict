@@ -182,6 +182,38 @@ async def test_runner_logs_no_op_diff_when_action_changes_no_cells(tmp_path: Pat
     assert "[DIFF] none" in log_text
 
 
+async def test_runner_emits_hierarchical_turn_plan_action_and_result_spans(tmp_path: Path) -> None:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("retrodict.test")
+    env = FakeEnv([make_frame()], [with_cell(make_frame(state=GameState.WIN, levels=7), 2, 1, 5)])
+    agent = FakeAgent([reply(plan_text("ACTION1"))])
+    runner = GameRunner(
+        env,
+        agent,
+        RunnerConfig(game_id="fake", model="fake:model", pricing=ModelPricing(1.0, 0.1, 10.0)),
+        tmp_path / "run",
+        tracer=tracer,
+    )
+
+    await runner.run()
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    turn = spans["retrodict.turn"]
+    assert spans["retrodict.plan"].parent.span_id == turn.context.span_id
+    assert spans["retrodict.action"].parent.span_id == turn.context.span_id
+    assert spans["retrodict.action"].attributes["retrodict.action.changed_cells"] == 1
+    assert spans["retrodict.action"].attributes["retrodict.action.outcome"] == "win"
+    assert "retrodict.game.reset" in spans
+    assert "retrodict.result" in spans
+    provider.shutdown()
+
+
 async def test_runner_omits_diff_for_agent_planned_reset(tmp_path: Path) -> None:
     env = FakeEnv([make_frame()], [with_cell(make_frame(state=GameState.WIN, levels=7), 1, 1, 9)])
     agent = FakeAgent([reply(plan_text("RESET"))])
@@ -549,7 +581,7 @@ async def test_run_game_copies_workspace_template_files(tmp_path: Path, monkeypa
     import arc3.runner as runner_module
 
     class DummyClient:
-        def __init__(self, cfg, workspace, trace_dir):
+        def __init__(self, cfg, workspace, trace_dir, **_kwargs):
             self.workspace = workspace
 
         async def aclose(self) -> None:

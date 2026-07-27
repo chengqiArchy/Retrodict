@@ -15,9 +15,12 @@ import os
 import shutil
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import quote
 
 from . import prompts
 from .logwriter import LogWriter, StepRecord, action_name, diff_boards, parse_log
@@ -127,13 +130,22 @@ class GameEnv(Protocol):
 class ThinAgentClient:
     """AgentClient backed by a thinharness Harness over the run workspace."""
 
-    def __init__(self, cfg: RunnerConfig, workspace: Path, trace_dir: Path, *, analysis_python: Path = ANALYSIS_PYTHON) -> None:
+    def __init__(
+        self,
+        cfg: RunnerConfig,
+        workspace: Path,
+        trace_dir: Path,
+        *,
+        analysis_python: Path = ANALYSIS_PYTHON,
+        logfire_tracing: Any | None = None,
+    ) -> None:
         from thinharness import Harness, HarnessConfig, TracingOptions, create_otlp_tracing
 
-        self.logfire_tracing = None
+        self.logfire_tracing = logfire_tracing
+        self._owns_logfire_tracing = False
         remote_tracing = []
         logfire_token = os.getenv("LOGFIRE_TOKEN", "").strip()
-        if logfire_token:
+        if self.logfire_tracing is None and logfire_token:
             endpoint = os.getenv(
                 "LOGFIRE_OTLP_TRACES_ENDPOINT",
                 "https://logfire-us.pydantic.dev/v1/traces",
@@ -144,6 +156,8 @@ class ThinAgentClient:
                 headers={"Authorization": logfire_token},
                 tracer_name="retrodict.thinharness",
             )
+            self._owns_logfire_tracing = True
+        if self.logfire_tracing is not None:
             remote_tracing.append(
                 TracingOptions(
                     tracer=self.logfire_tracing.tracer,
@@ -195,7 +209,7 @@ class ThinAgentClient:
         try:
             await self.harness.aclose()
         finally:
-            if self.logfire_tracing is not None:
+            if self.logfire_tracing is not None and self._owns_logfire_tracing:
                 self.logfire_tracing.force_flush()
                 self.logfire_tracing.shutdown()
 
@@ -246,7 +260,16 @@ class RunState:
 class GameRunner:
     """Run one game to a terminal condition."""
 
-    def __init__(self, env: GameEnv, agent: AgentClient, cfg: RunnerConfig, run_dir: Path, *, resume: bool = False) -> None:
+    def __init__(
+        self,
+        env: GameEnv,
+        agent: AgentClient,
+        cfg: RunnerConfig,
+        run_dir: Path,
+        *,
+        resume: bool = False,
+        tracer: Any | None = None,
+    ) -> None:
         self.env = env
         self.agent = agent
         self.cfg = cfg
@@ -261,6 +284,13 @@ class GameRunner:
         self.resume_requested = resume
         self.resumed_at_actions: int | None = None
         self.prime_note: str | None = None
+        self.tracer = tracer
+
+    def _span(self, name: str, attributes: dict[str, Any] | None = None):
+        if self.tracer is None:
+            return nullcontext(None)
+        clean = {key: value for key, value in (attributes or {}).items() if value is not None}
+        return self.tracer.start_as_current_span(name, attributes=clean)
 
     async def run(self) -> dict[str, Any]:
         """Play until WIN, a cap, or a failure; return (and write) metrics."""
@@ -279,16 +309,36 @@ class GameRunner:
                 stop_reason = "provider_error"
         metrics = self._metrics(stop_reason, time.time() - started)
         (self.run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+        with self._span(
+            "retrodict.result",
+            {
+                "retrodict.stop_reason": metrics["stop_reason"],
+                "retrodict.state": metrics["state"],
+                "retrodict.levels_completed": metrics["levels_completed"],
+                "retrodict.actions": metrics["actions"],
+                "retrodict.invocations": metrics["invocations"],
+                "retrodict.surprises": metrics["surprises"],
+                "retrodict.cost_usd": metrics["cost_usd"],
+                "retrodict.wall_seconds": metrics["wall_seconds"],
+            },
+        ):
+            pass
         return metrics
 
     def _start_fresh(self) -> str | None:
-        self.frame = self.env.reset()
-        if self.frame is None:
-            return "env_error"
-        self.state.actions_taken += 1
-        self._log_frame("RESET")
-        self._start_level()
-        return None
+        with self._span("retrodict.game.reset", {"retrodict.reset.reason": "start"}) as span:
+            self.frame = self.env.reset()
+            if self.frame is None:
+                if span is not None:
+                    span.set_attribute("retrodict.reset.outcome", "env_error")
+                return "env_error"
+            self.state.actions_taken += 1
+            self._log_frame("RESET")
+            self._start_level()
+            if span is not None:
+                span.set_attribute("retrodict.reset.outcome", "ok")
+                span.set_attribute("retrodict.levels_completed", self.frame.levels_completed)
+            return None
 
     def _image_prime(self) -> None:
         """Ask a vision model to read the opening frame; store its answer for the first prompt.
@@ -398,10 +448,25 @@ class GameRunner:
                 return "cost_cap"
             if self.state.actions_taken >= self.cfg.action_cap:
                 return "action_cap"
-            plan = await self._invoke(reason)
-            if plan is None:
-                return "plan_parse_failed"
-            reason = self._drain(plan)
+            with self._span(
+                "retrodict.turn",
+                {
+                    "retrodict.turn.number": self.state.invocations + 1,
+                    "retrodict.turn.reason": reason,
+                    "retrodict.levels_completed": self.frame.levels_completed,
+                    "retrodict.actions_before": self.state.actions_taken,
+                    "retrodict.resumed": self.resume_requested,
+                },
+            ) as turn_span:
+                plan = await self._invoke(reason)
+                if plan is None:
+                    if turn_span is not None:
+                        turn_span.set_attribute("retrodict.turn.outcome", "plan_parse_failed")
+                    return "plan_parse_failed"
+                reason = self._drain(plan)
+                if turn_span is not None:
+                    turn_span.set_attribute("retrodict.turn.outcome", reason)
+                    turn_span.set_attribute("retrodict.actions_after", self.state.actions_taken)
             if reason in {"win", "action_cap", "env_error"}:
                 return reason
 
@@ -507,9 +572,21 @@ class GameRunner:
             max_actions=self.cfg.action_cap - self.state.actions_taken,
             truncated=reply.truncated,
         )
-        rendered = " ".join(_render_action(action) for action in plan.actions)
-        self.log.append_plan(self.state.invocations, f"{plan.reasoning}\nplan: {rendered}")
-        self.state.last_planned_step = self.state.step_no
+        rendered_actions = [_render_action(action) for action in plan.actions]
+        rendered = " ".join(rendered_actions)
+        with self._span(
+            "retrodict.plan",
+            {
+                "retrodict.invocation": self.state.invocations,
+                "retrodict.plan.action_count": len(plan.actions),
+                "retrodict.plan.actions": json.dumps(rendered_actions),
+                "retrodict.plan.clamped": plan.clamped,
+                "retrodict.plan.expect_levels": plan.expect_levels,
+                "retrodict.plan.has_cell_expectations": any(action.expect for action in plan.actions),
+            },
+        ):
+            self.log.append_plan(self.state.invocations, f"{plan.reasoning}\nplan: {rendered}")
+            self.state.last_planned_step = self.state.step_no
         return plan
 
     def _available_names(self) -> set[str]:
@@ -533,36 +610,73 @@ class GameRunner:
             self.state.surprises += 1
             note = f"you expected {plan.expect_levels} completed levels after the plan; the board shows {self.frame.levels_completed}"
             self.state.surprise_note = note
+            with self._span(
+                "retrodict.prediction_mismatch",
+                {
+                    "retrodict.prediction.kind": "levels_completed",
+                    "retrodict.prediction.expected_levels": plan.expect_levels,
+                    "retrodict.prediction.actual_levels": self.frame.levels_completed,
+                },
+            ):
+                pass
             return "prediction_mismatch"
         return "queue_empty"
 
     def _step(self, action: PlannedAction) -> str | None:
         from arcengine import GameAction
 
-        prev_levels = self.frame.levels_completed
-        prev_state = self.frame.state
-        prev_settled = _board_lists(self.frame.frame[-1])
-        data = {"x": action.x, "y": action.y} if action.name == "ACTION6" else None
-        frame = self.env.step(GameAction.from_name(action.name), data)
-        if frame is None:
-            return "env_error"
-        self.frame = frame
-        self.state.actions_taken += 1
-        self.state.step_no += 1
-        self._log_frame(action.name, x=action.x, y=action.y, prior_settled=None if action.name == "RESET" else prev_settled)
-        if action.name == "RESET":
-            self.state.level_self_resets += 1
-        state = frame.state.value
-        if state == "WIN":
-            return "win"
-        if state == "GAME_OVER":
-            return self._reset_after_game_over()
-        if frame.levels_completed != prev_levels:
-            self._start_level()
-            return "level_change"
-        if frame.state != prev_state:
-            return "state_change"
-        return self._check_expectations(action)
+        with self._span(
+            "retrodict.action",
+            {
+                "retrodict.step": self.state.step_no + 1,
+                "retrodict.action.name": action.name,
+                "retrodict.action.x": action.x,
+                "retrodict.action.y": action.y,
+                "retrodict.action.has_expectations": bool(action.expect),
+            },
+        ) as span:
+            prev_levels = self.frame.levels_completed
+            prev_state = self.frame.state
+            prev_settled = _board_lists(self.frame.frame[-1])
+            data = {"x": action.x, "y": action.y} if action.name == "ACTION6" else None
+            frame = self.env.step(GameAction.from_name(action.name), data)
+            if frame is None:
+                if span is not None:
+                    span.set_attribute("retrodict.action.outcome", "env_error")
+                return "env_error"
+            self.frame = frame
+            self.state.actions_taken += 1
+            self.state.step_no += 1
+            diff_count = self._log_frame(
+                action.name,
+                x=action.x,
+                y=action.y,
+                prior_settled=None if action.name == "RESET" else prev_settled,
+            )
+            if action.name == "RESET":
+                self.state.level_self_resets += 1
+            state = frame.state.value
+            if state == "WIN":
+                outcome = "win"
+            elif state == "GAME_OVER":
+                outcome = self._reset_after_game_over()
+            elif frame.levels_completed != prev_levels:
+                self._start_level()
+                outcome = "level_change"
+            elif frame.state != prev_state:
+                outcome = "state_change"
+            else:
+                outcome = self._check_expectations(action)
+            if span is not None:
+                span.set_attribute("retrodict.action.outcome", outcome or "continue")
+                span.set_attribute("retrodict.action.state_before", prev_state.value)
+                span.set_attribute("retrodict.action.state_after", frame.state.value)
+                span.set_attribute("retrodict.action.levels_before", prev_levels)
+                span.set_attribute("retrodict.action.levels_after", frame.levels_completed)
+                span.set_attribute("retrodict.action.animation_frames", len(frame.frame))
+                if diff_count is not None:
+                    span.set_attribute("retrodict.action.changed_cells", diff_count)
+            return outcome
 
     def _check_expectations(self, action: PlannedAction) -> str | None:
         if not action.expect:
@@ -577,6 +691,15 @@ class GameRunner:
             return None
         self.state.surprises += 1
         self.state.surprise_note = f"after {action.name}: " + "; ".join(mismatches[:5])
+        with self._span(
+            "retrodict.prediction_mismatch",
+            {
+                "retrodict.prediction.kind": "cell_values",
+                "retrodict.prediction.mismatch_count": len(mismatches),
+                "retrodict.prediction.cells": json.dumps([[x, y] for x, y, _ in action.expect]),
+            },
+        ):
+            pass
         return "prediction_mismatch"
 
     def _start_level(self) -> None:
@@ -590,14 +713,19 @@ class GameRunner:
     def _reset_after_game_over(self) -> str:
         if self.state.actions_taken >= self.cfg.action_cap:
             return "action_cap"
-        frame = self.env.reset()
-        if frame is None:
-            return "env_error"
-        self.frame = frame
-        self.state.actions_taken += 1
-        self.state.step_no += 1
-        self._log_frame("RESET")
-        return "game_over"
+        with self._span("retrodict.game.reset", {"retrodict.reset.reason": "game_over"}) as span:
+            frame = self.env.reset()
+            if frame is None:
+                if span is not None:
+                    span.set_attribute("retrodict.reset.outcome", "env_error")
+                return "env_error"
+            self.frame = frame
+            self.state.actions_taken += 1
+            self.state.step_no += 1
+            self._log_frame("RESET")
+            if span is not None:
+                span.set_attribute("retrodict.reset.outcome", "ok")
+            return "game_over"
 
     def _log_frame(
         self,
@@ -606,7 +734,7 @@ class GameRunner:
         x: int | None = None,
         y: int | None = None,
         prior_settled: list[list[int]] | None = None,
-    ) -> None:
+    ) -> int | None:
         frame = self.frame
         frames = [_board_lists(board) for board in frame.frame]
         diff = diff_boards(prior_settled, frames[-1]) if prior_settled is not None else None
@@ -624,6 +752,7 @@ class GameRunner:
             ),
             diff=diff,
         )
+        return len(diff) if diff is not None else None
 
     # -- accounting ----------------------------------------------------------
 
@@ -739,6 +868,68 @@ def write_scorecard(arcade, run_dir: Path) -> None:
         print(f"warning: could not persist scorecard: {exc}", file=sys.stderr)
 
 
+def _create_logfire_tracing():
+    """Create one provider for the whole Retrodict pass, including ThinHarness."""
+    logfire_token = os.getenv("LOGFIRE_TOKEN", "").strip()
+    if not logfire_token:
+        return None
+    from thinharness import create_otlp_tracing
+
+    endpoint = os.getenv(
+        "LOGFIRE_OTLP_TRACES_ENDPOINT",
+        "https://logfire-us.pydantic.dev/v1/traces",
+    ).strip()
+    return create_otlp_tracing(
+        service_name="retrodict",
+        endpoint=endpoint,
+        headers={"Authorization": logfire_token},
+        tracer_name="retrodict.runner",
+    )
+
+
+def _upstream_trace_context():
+    """Extract the W3C parent injected by LARC, if this pass was web-launched."""
+    traceparent = os.getenv("TRACEPARENT", "").strip()
+    if not traceparent:
+        return None
+    from opentelemetry.propagate import extract
+
+    carrier = {"traceparent": traceparent}
+    if tracestate := os.getenv("TRACESTATE", "").strip():
+        carrier["tracestate"] = tracestate
+    return extract(carrier)
+
+
+def _logfire_metadata(span: Any) -> dict[str, str]:
+    """Return display-safe IDs and a durable UI URL for one pass span."""
+    if span is None:
+        return {}
+    from opentelemetry.trace import format_span_id, format_trace_id
+
+    context = span.get_span_context()
+    if not context.is_valid:
+        return {}
+    trace_id = format_trace_id(context.trace_id)
+    span_id = format_span_id(context.span_id)
+    project_url = os.getenv(
+        "LOGFIRE_PROJECT_URL",
+        "https://logfire-us.pydantic.dev/archyzhengchengqi/arcproject",
+    ).strip().rstrip("/")
+    query = quote(f"trace_id='{trace_id}'", safe="")
+    pass_query = quote(f"trace_id='{trace_id}' AND span_id='{span_id}'", safe="")
+    now = datetime.now(UTC)
+    time_range = (
+        f"&since={quote((now - timedelta(minutes=5)).isoformat(), safe='')}"
+        f"&until={quote((now + timedelta(days=1)).isoformat(), safe='')}"
+    )
+    return {
+        "trace_id": trace_id,
+        "pass_span_id": span_id,
+        "url": f"{project_url}/?q={query}{time_range}",
+        "pass_url": f"{project_url}/?q={pass_query}{time_range}",
+    }
+
+
 async def run_game(cfg: RunnerConfig, runs_root: Path, mode: str = "normal", resume_dir: Path | None = None) -> dict[str, Any]:
     """Materialize a run directory, gate on containment, and play one game."""
     if resume_dir is not None:
@@ -753,21 +944,92 @@ async def run_game(cfg: RunnerConfig, runs_root: Path, mode: str = "normal", res
             shutil.copytree(WORKSPACE_TEMPLATE, workspace, dirs_exist_ok=True)
         workspace.mkdir(parents=True, exist_ok=True)
 
-    report = containment_check(workspace)
-    (run_dir / "containment.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    if not report["contained"]:
-        raise RuntimeError(f"containment check failed, aborting: {report}")
-
-    env, arcade = open_environment(cfg.game_id, run_dir, mode)
-    select_target_level(env, cfg.target_level_index)
-    agent = ThinAgentClient(cfg, workspace, trace_dir=run_dir / "traces")
+    tracing = _create_logfire_tracing()
+    tracer = tracing.tracer if tracing is not None else None
+    pass_attributes: dict[str, Any] = {
+        "larc.run.id": os.getenv("LARC_RETRODICT_RUN_ID", ""),
+        "retrodict.pass.index": int(os.getenv("LARC_RETRODICT_PASS_INDEX", "0") or 0),
+        "retrodict.game.id": cfg.game_id,
+        "retrodict.target_level_index": cfg.target_level_index,
+        "retrodict.model": cfg.model,
+        "retrodict.reasoning_effort": cfg.reasoning_effort,
+        "retrodict.mode": mode,
+        "retrodict.action_cap": cfg.action_cap,
+        "retrodict.cost_cap_usd": cfg.cost_cap_usd,
+        "retrodict.run_dir": str(run_dir),
+        "retrodict.resumed": resume_dir is not None,
+    }
+    pass_attributes = {key: value for key, value in pass_attributes.items() if value not in {None, ""}}
+    pass_context = (
+        tracer.start_as_current_span(
+            "retrodict.pass",
+            context=_upstream_trace_context(),
+            attributes=pass_attributes,
+        )
+        if tracer is not None
+        else nullcontext(None)
+    )
     try:
-        metrics = await GameRunner(env, agent, cfg, run_dir, resume=resume_dir is not None).run()
+        with pass_context as pass_span:
+            logfire_metadata = _logfire_metadata(pass_span)
+            if logfire_metadata:
+                (run_dir / "logfire.json").write_text(
+                    json.dumps(logfire_metadata, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            with (
+                tracer.start_as_current_span("retrodict.setup")
+                if tracer is not None
+                else nullcontext(None)
+            ) as setup_span:
+                report = containment_check(workspace)
+                (run_dir / "containment.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+                if setup_span is not None:
+                    setup_span.set_attribute("retrodict.containment.passed", report["contained"])
+                if not report["contained"]:
+                    raise RuntimeError(f"containment check failed, aborting: {report}")
+
+                env, arcade = open_environment(cfg.game_id, run_dir, mode)
+                select_target_level(env, cfg.target_level_index)
+                agent = ThinAgentClient(
+                    cfg,
+                    workspace,
+                    trace_dir=run_dir / "traces",
+                    logfire_tracing=tracing,
+                )
+            try:
+                metrics = await GameRunner(
+                    env,
+                    agent,
+                    cfg,
+                    run_dir,
+                    resume=resume_dir is not None,
+                    tracer=tracer,
+                ).run()
+            finally:
+                await agent.aclose()
+                write_scorecard(arcade, run_dir)
+            metrics["run_dir"] = str(run_dir)
+            if logfire_metadata:
+                metrics["logfire_trace_id"] = logfire_metadata["trace_id"]
+                metrics["logfire_pass_span_id"] = logfire_metadata["pass_span_id"]
+                metrics["logfire_url"] = logfire_metadata["url"]
+                metrics["logfire_pass_url"] = logfire_metadata["pass_url"]
+                (run_dir / "metrics.json").write_text(
+                    json.dumps(metrics, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            if pass_span is not None:
+                pass_span.set_attribute("retrodict.pass.stop_reason", metrics["stop_reason"])
+                pass_span.set_attribute("retrodict.pass.state", metrics["state"] or "")
+                pass_span.set_attribute("retrodict.pass.actions", metrics["actions"])
+                pass_span.set_attribute("retrodict.pass.levels_completed", metrics["levels_completed"] or 0)
+                pass_span.set_attribute("retrodict.pass.cost_usd", metrics["cost_usd"])
+            return metrics
     finally:
-        await agent.aclose()
-        write_scorecard(arcade, run_dir)
-    metrics["run_dir"] = str(run_dir)
-    return metrics
+        if tracing is not None:
+            tracing.force_flush()
+            tracing.shutdown()
 
 
 def main(argv: list[str] | None = None) -> None:
