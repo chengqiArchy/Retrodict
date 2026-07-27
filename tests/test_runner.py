@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,7 @@ from arcengine import FrameDataRaw, GameState
 
 from arc3.logwriter import diff_boards, parse_log
 from arc3.plan_parser import PlanParseError, parse_actions
-from arc3.runner import AgentClient, AgentReply, GameRunner, ModelPricing, RunnerConfig, run_game
+from arc3.runner import AgentClient, AgentReply, GameRunner, ModelPricing, RunnerConfig, run_game, select_target_level
 
 
 def make_frame(
@@ -60,6 +61,28 @@ class FakeEnv:
         if self.cycle:
             return self.step_frames[self.steps.__len__() % len(self.step_frames) - 1]
         return self.step_frames.pop(0)
+
+
+def test_select_target_level_pins_local_game_before_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeGame:
+        selected: list[int] = []
+
+        def set_level(self, index: int) -> None:
+            self.selected.append(index)
+
+    game = FakeGame()
+    env = type("LocalEnv", (), {"_game": game})()
+    monkeypatch.delenv("ONLY_RESET_LEVELS", raising=False)
+
+    select_target_level(env, 2)
+
+    assert game.selected == [2]
+    assert os.environ["ONLY_RESET_LEVELS"] == "true"
+
+
+def test_select_target_level_rejects_remote_environment() -> None:
+    with pytest.raises(RuntimeError, match="local ARC environment"):
+        select_target_level(object(), 1)
 
 
 @dataclass

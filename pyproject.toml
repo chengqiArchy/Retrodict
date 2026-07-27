@@ -5,7 +5,7 @@ description = "Retrodict: an ARC-AGI-3 agent built on ThinHarness"
 requires-python = ">=3.12"
 dependencies = [
     "arc-agi",
-    "thinharness",
+    "thinharness[tracing]",
     "pydantic>=2",
     "openai>=2.44.0",
     "numpy>=2",

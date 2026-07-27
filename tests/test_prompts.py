@@ -108,6 +108,14 @@ def test_invocation_prompts_nudge_agents_to_use_arclog_and_diff() -> None:
     assert "import arclog; steps = arclog.load()" in prompts.fresh_session_prompt("ft09", 10, "resumed")
 
 
+def test_initial_prompt_names_a_directly_selected_starting_level() -> None:
+    prompt = prompts.initial_prompt("ls20", target_level_index=2)
+
+    assert "selected level 3" in prompt
+    assert "rather than level 1" in prompt
+    assert "levels_completed count starts at 0" in prompt
+
+
 def test_fresh_session_prompt_directs_reading_playbook_first() -> None:
     """A fresh session is exactly the moment curated memory pays off: it must read playbook.md before
     reconstructing from the raw log, and trust it for settled rules rather than re-deriving them."""

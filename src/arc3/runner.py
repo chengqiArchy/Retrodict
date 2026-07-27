@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import shutil
 import sys
 import time
@@ -71,6 +72,7 @@ class RunnerConfig:
     """Per-run knobs; defaults are the pilot protocol (gpt-5.5 at high effort, $80 cost cap, 2k action cap)."""
 
     game_id: str
+    target_level_index: int = 0
     model: str = "openai:gpt-5.5"
     reasoning_effort: str | None = "high"
     max_output_tokens: int = 32_768
@@ -126,7 +128,36 @@ class ThinAgentClient:
     """AgentClient backed by a thinharness Harness over the run workspace."""
 
     def __init__(self, cfg: RunnerConfig, workspace: Path, trace_dir: Path, *, analysis_python: Path = ANALYSIS_PYTHON) -> None:
-        from thinharness import Harness, HarnessConfig
+        from thinharness import Harness, HarnessConfig, TracingOptions, create_otlp_tracing
+
+        self.logfire_tracing = None
+        remote_tracing = []
+        logfire_token = os.getenv("LOGFIRE_TOKEN", "").strip()
+        if logfire_token:
+            endpoint = os.getenv(
+                "LOGFIRE_OTLP_TRACES_ENDPOINT",
+                "https://logfire-us.pydantic.dev/v1/traces",
+            ).strip()
+            self.logfire_tracing = create_otlp_tracing(
+                service_name="retrodict-llm",
+                endpoint=endpoint,
+                headers={"Authorization": logfire_token},
+                tracer_name="retrodict.thinharness",
+            )
+            remote_tracing.append(
+                TracingOptions(
+                    tracer=self.logfire_tracing.tracer,
+                    agent_name="retrodict",
+                    agent_description="ARC-AGI-3 Retrodict inference agent",
+                    conversation_id=(
+                        f"{cfg.game_id}:level-{cfg.target_level_index + 1}:"
+                        f"{workspace.parent.name}"
+                    ),
+                    capture_messages=True,
+                    capture_tool_args=True,
+                    capture_tool_results=True,
+                )
+            )
 
         # Provider-neutral settings; thinharness translates them to each provider's
         # dialect (OpenAI max_output_tokens+reasoning.effort, OpenRouter
@@ -141,6 +172,7 @@ class ThinAgentClient:
             max_tokens=cfg.max_output_tokens,
             effort=cfg.reasoning_effort,
             local_trace_dir=trace_dir,
+            tracing=remote_tracing,
         )
         self.harness = Harness(config, tools=[PythonTool(workspace, analysis_python).spec()])
 
@@ -160,7 +192,12 @@ class ThinAgentClient:
         )
 
     async def aclose(self) -> None:
-        await self.harness.aclose()
+        try:
+            await self.harness.aclose()
+        finally:
+            if self.logfire_tracing is not None:
+                self.logfire_tracing.force_flush()
+                self.logfire_tracing.shutdown()
 
 
 def _hit_output_token_limit(responses: list[dict[str, Any]]) -> bool:
@@ -389,7 +426,11 @@ class GameRunner:
             reason_text = f"{reason_text} ({self.state.surprise_note})"
             self.state.surprise_note = None
         if self.state.invocations == 0:
-            return prompts.initial_prompt(self.cfg.game_id, self.prime_note), None
+            return prompts.initial_prompt(
+                self.cfg.game_id,
+                self.prime_note,
+                self.cfg.target_level_index,
+            ), None
         directive = self._escalation_directive()
         if self.state.resume_state is None or self.state.context_tokens > self.cfg.fresh_session_input_tokens:
             self.state.fresh_sessions += 1
@@ -667,6 +708,25 @@ def open_environment(game_id: str, run_dir: Path, mode: str):
     return env, arcade
 
 
+def select_target_level(env: Any, target_level_index: int) -> None:
+    """Pin a local ARC environment to a zero-based level before its first RESET."""
+    if target_level_index < 0:
+        raise ValueError("target_level_index must be non-negative")
+    if target_level_index == 0:
+        return
+    game = getattr(env, "_game", None)
+    set_level = getattr(game, "set_level", None)
+    if not callable(set_level):
+        raise RuntimeError(
+            "Retrodict target-level runs require a local ARC environment; "
+            "the configured remote environment cannot select a level."
+        )
+    # Keep the first RESET on the selected level instead of allowing the ARC
+    # engine's full reset to return the environment to level zero.
+    os.environ["ONLY_RESET_LEVELS"] = "true"
+    set_level(target_level_index)
+
+
 def write_scorecard(arcade, run_dir: Path) -> None:
     """Persist the engine's official scorecard (per-level actions and scores) beside metrics.json."""
     try:
@@ -699,6 +759,7 @@ async def run_game(cfg: RunnerConfig, runs_root: Path, mode: str = "normal", res
         raise RuntimeError(f"containment check failed, aborting: {report}")
 
     env, arcade = open_environment(cfg.game_id, run_dir, mode)
+    select_target_level(env, cfg.target_level_index)
     agent = ThinAgentClient(cfg, workspace, trace_dir=run_dir / "traces")
     try:
         metrics = await GameRunner(env, agent, cfg, run_dir, resume=resume_dir is not None).run()
@@ -712,6 +773,7 @@ async def run_game(cfg: RunnerConfig, runs_root: Path, mode: str = "normal", res
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run the RGB-style ARC-AGI-3 agent on one game.")
     parser.add_argument("game_id", help="e.g. ls20 or ls20-9607627b")
+    parser.add_argument("--target-level-index", type=int, default=0, help="zero-based local level to start from")
     parser.add_argument("--model", default="openai:gpt-5.5")
     parser.add_argument("--effort", default="high", help="reasoning effort; 'none' disables the reasoning field")
     parser.add_argument("--mode", default="normal", choices=["normal", "offline", "online"], help="arc-agi operation mode")
@@ -725,6 +787,7 @@ def main(argv: list[str] | None = None) -> None:
 
     cfg = RunnerConfig(
         game_id=args.game_id,
+        target_level_index=args.target_level_index,
         model=args.model,
         reasoning_effort=None if args.effort == "none" else args.effort,
         action_cap=args.action_cap,

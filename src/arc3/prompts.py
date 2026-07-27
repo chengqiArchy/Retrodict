@@ -163,13 +163,22 @@ after the final action. The first failed expectation stops execution immediately
 with the mismatch, instead of the rest of the plan running on a falsified premise."""
 
 
-def initial_prompt(game_id: str, prime_note: str | None = None) -> str:
+def initial_prompt(
+    game_id: str,
+    prime_note: str | None = None,
+    target_level_index: int = 0,
+) -> str:
     """First invocation of a run; prime_note is an optional vision-model read of the opening frame."""
     base = (
         f"You are starting a fresh run of game '{game_id}'. log.txt contains step 0 (the initial board after RESET). "
         "Start with python using `import arclog; steps = arclog.load()` to inspect the board through the helper, "
         "then reply with your analysis and your first [ACTIONS] block."
     )
+    if target_level_index:
+        base += (
+            f" LARC selected level {target_level_index + 1} as the starting level, and the board in step 0 is "
+            f"that level rather than level 1. The log's levels_completed count starts at 0 for this isolated run."
+        )
     if prime_note:
         base += (
             "\n\n## An outside vision model's read of the opening frame\n\n"
