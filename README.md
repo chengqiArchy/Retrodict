@@ -77,7 +77,9 @@ uv sync
 Model requests, including the optional image-prime request, use the LiteLLM Python SDK. CLI model references keep the
 `provider:model` spelling and are translated to LiteLLM provider paths internally. Set the provider key such as
 `OPENAI_API_KEY`, or use `LITELLM_API_KEY` with `LITELLM_BASE_URL` for a shared gateway (the example dotenv remains
-`../thinharness/.env`). Games download into `environment_files/` on first use and run locally in-process.
+`../thinharness/.env`). Retrodict also follows Duck's local proxy convention: a shared non-OpenRouter
+`OPENROUTER_API_KEY` uses `LLM_MAIN_API_BASE` when set, otherwise `http://localhost:8317/v1`. Games download into
+`environment_files/` on first use and run locally in-process.
 
 ```bash
 uv run --env-file ../thinharness/.env arc3-run <game> --model openai:gpt-5.6-sol --effort max --cost-cap 20 --image-prime

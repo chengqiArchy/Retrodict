@@ -27,8 +27,10 @@ def configure_litellm_instrumentation() -> bool:
 
         logfire.configure(
             token=token,
-            service_name="retrodict-litellm",
-            send_to_logfire=True,
+            service_name=os.getenv("LOGFIRE_SERVICE_NAME", "retrodict-litellm"),
+            environment=os.getenv("LOGFIRE_ENVIRONMENT", "development"),
+            send_to_logfire="if-token-present",
+            distributed_tracing=True,
             console=False,
         )
         logfire.instrument_litellm()
@@ -47,7 +49,20 @@ def _provider_setting(model_ref: str, setting: str) -> str | None:
     names = [f"LITELLM_{setting}", f"{provider.upper()}_{setting}"]
     if provider == "openai" and setting == "BASE_URL":
         names.append("OPENAI_API_BASE")
+    if setting == "BASE_URL":
+        names.append("LLM_MAIN_API_BASE")
+    if provider == "openai" and setting == "API_KEY":
+        names.append("OPENROUTER_API_KEY")
     return next((value for name in names if (value := os.getenv(name, "").strip())), None)
+
+
+def _default_base_url(provider_name: str, api_key: str | None) -> str:
+    """Match Duck's local CLIProxy default for shared non-native provider keys."""
+    if api_key and not api_key.startswith("sk-or-v1-") and provider_name in {"openai", "openrouter"}:
+        return "http://localhost:8317/v1"
+    if provider_name == "openrouter":
+        return "https://openrouter.ai/api/v1"
+    return ""
 
 
 class LiteLLMResponsesProvider(OpenAIProvider):
@@ -64,10 +79,11 @@ class LiteLLMResponsesProvider(OpenAIProvider):
         timeout: int = 120,
     ) -> None:
         provider_name, _ = parse_model_ref(model_ref)
-        default_base_url = "https://openrouter.ai/api/v1" if provider_name == "openrouter" else ""
+        resolved_api_key = api_key or _provider_setting(model_ref, "API_KEY")
+        default_base_url = _default_base_url(provider_name, resolved_api_key)
         Provider.__init__(
             self,
-            api_key=api_key or _provider_setting(model_ref, "API_KEY"),
+            api_key=resolved_api_key,
             base_url=api_base or _provider_setting(model_ref, "BASE_URL") or default_base_url,
             timeout=timeout,
         )

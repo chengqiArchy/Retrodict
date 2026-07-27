@@ -35,7 +35,8 @@ def test_logfire_litellm_instrumentation_is_enabled_once(
     configure_kwargs = calls[0][1]
     assert isinstance(configure_kwargs, dict)
     assert configure_kwargs["service_name"] == "retrodict-litellm"
-    assert configure_kwargs["send_to_logfire"] is True
+    assert configure_kwargs["send_to_logfire"] == "if-token-present"
+    assert configure_kwargs["distributed_tracing"] is True
 
 
 @pytest.mark.asyncio
@@ -75,14 +76,41 @@ async def test_openrouter_responses_sets_endpoint_and_auth_header(monkeypatch: p
         return {"id": "resp_1", "output": []}
 
     monkeypatch.setattr("litellm.aresponses", fake_aresponses)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-test-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-openrouter-test-key")
     provider = LiteLLMResponsesProvider("openrouter:openai/gpt-5.5")
 
     await provider.create_response({"input": "hello"})
 
     assert captured["model"] == "openrouter/openai/gpt-5.5"
     assert captured["api_base"] == "https://openrouter.ai/api/v1"
-    assert captured["extra_headers"] == {"Authorization": "Bearer openrouter-test-key"}
+    assert captured["extra_headers"] == {"Authorization": "Bearer sk-or-v1-openrouter-test-key"}
+
+
+def test_openai_model_uses_duck_shared_proxy_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("LITELLM_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.delenv("LLM_MAIN_API_BASE", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "shared-proxy-test-key")
+
+    provider = LiteLLMResponsesProvider("openai:gpt-5.5")
+
+    assert provider.api_key == "shared-proxy-test-key"
+    assert provider.base_url == "http://localhost:8317/v1"
+
+
+def test_duck_api_base_override_wins_over_local_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LITELLM_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "shared-proxy-test-key")
+    monkeypatch.setenv("LLM_MAIN_API_BASE", "https://proxy.example/v1")
+
+    provider = LiteLLMResponsesProvider("openai:gpt-5.5")
+
+    assert provider.base_url == "https://proxy.example/v1"
 
 
 def test_build_model_preserves_thinharness_responses_semantics() -> None:
