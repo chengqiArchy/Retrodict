@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-import tempfile
-from pathlib import Path
 
 import logfire
 from opentelemetry import trace
 from opentelemetry.trace import format_trace_id
-from thinharness import Harness, HarnessConfig
+from thinharness import RequestConstants, ToolOutput
 
 from arc3.litellm_provider import build_litellm_model, configure_litellm_instrumentation
 
@@ -18,29 +16,39 @@ from arc3.litellm_provider import build_litellm_model, configure_litellm_instrum
 async def smoke() -> str:
     model_ref = os.getenv("RETRODICT_SMOKE_MODEL", "openai:gpt-5.5")
     configure_litellm_instrumentation()
-    with tempfile.TemporaryDirectory(prefix="retrodict-litellm-smoke-") as tmp:
-        config = HarnessConfig(
-            root=Path(tmp),
-            model=model_ref,
-            system_prompt="Answer concisely.",
-            builtin_tools=[],
-            max_model_requests=1,
-            request_timeout=60,
-            max_tokens=128,
-            effort="low",
-            local_tracing=False,
+    model = build_litellm_model(model_ref, timeout=60, max_tokens=128, effort="low")
+    session = model.new_session()
+    constants = RequestConstants(
+        instructions="Use the provided tool exactly once, then answer concisely.",
+        tools=[
+            {
+                "type": "function",
+                "name": "echo",
+                "description": "Return the supplied value.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+            }
+        ],
+    )
+    with logfire.span("retrodict LiteLLM chat completion tool smoke test"):
+        trace_id = format_trace_id(trace.get_current_span().get_span_context().trace_id)
+        first = await session.start(
+            "Call echo with value OK. After receiving its result, reply exactly: OK",
+            constants,
         )
-        model = build_litellm_model(model_ref, timeout=60, max_tokens=128, effort="low")
-        harness = Harness(config, model=model)
-        try:
-            with logfire.span("retrodict LiteLLM smoke test"):
-                trace_id = format_trace_id(trace.get_current_span().get_span_context().trace_id)
-                result = await harness.run("Reply exactly: OK")
-                if not result.text.strip():
-                    raise RuntimeError("LiteLLM smoke returned empty text")
-                logfire.info("LiteLLM smoke succeeded", model=model_ref)
-        finally:
-            await harness.aclose()
+        if not first.tool_calls:
+            raise RuntimeError("LiteLLM smoke did not return a tool call")
+        second = await session.continue_with_tools(
+            [ToolOutput(call_id=first.tool_calls[0].id, output="OK")],
+            constants,
+        )
+        if second.text.strip() != "OK":
+            raise RuntimeError(f"LiteLLM smoke returned unexpected final text: {second.text!r}")
+        logfire.info("LiteLLM full-history tool smoke succeeded", model=model_ref)
     logfire.force_flush()
     return trace_id
 

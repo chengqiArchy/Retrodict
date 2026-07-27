@@ -7,7 +7,14 @@ import os
 import threading
 from typing import Any
 
-from thinharness import ModelSettings, OpenAIProvider, OpenAIResponsesModel, Provider, parse_model_ref
+from thinharness import (
+    ModelSettings,
+    OpenAIProvider,
+    OpenRouterModel,
+    OpenRouterProvider,
+    Provider,
+    parse_model_ref,
+)
 from thinharness.providers import ProviderError
 
 _instrumentation_lock = threading.Lock()
@@ -122,15 +129,68 @@ class LiteLLMResponsesProvider(OpenAIProvider):
         return data
 
 
+class LiteLLMChatCompletionsProvider(OpenRouterProvider):
+    """Send full-history Chat Completions payloads through LiteLLM."""
+
+    name = "LiteLLM"
+
+    def __init__(
+        self,
+        model_ref: str,
+        *,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        timeout: int = 120,
+    ) -> None:
+        provider_name, _ = parse_model_ref(model_ref)
+        resolved_api_key = api_key or _provider_setting(model_ref, "API_KEY")
+        default_base_url = _default_base_url(provider_name, resolved_api_key)
+        Provider.__init__(
+            self,
+            api_key=resolved_api_key,
+            base_url=api_base or _provider_setting(model_ref, "BASE_URL") or default_base_url,
+            timeout=timeout,
+        )
+        self.provider_name = provider_name
+        self.model_name = litellm_model_name(model_ref)
+
+    async def create_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Call LiteLLM completion while preserving ThinHarness' full message history."""
+        from litellm import completion
+
+        request = {**payload, "model": self.model_name, "timeout": self.timeout}
+        reasoning = request.pop("reasoning", None)
+        if isinstance(reasoning, dict) and reasoning.get("effort"):
+            request["reasoning_effort"] = reasoning["effort"]
+        if self.api_key:
+            request["api_key"] = self.api_key
+        if self.base_url:
+            request["api_base"] = self.base_url
+        try:
+            response = await asyncio.to_thread(completion, **request)
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            raise ProviderError(f"LiteLLM request failed: {exc}", status_code=status_code) from exc
+        if isinstance(response, dict):
+            return response
+        model_dump = getattr(response, "model_dump", None)
+        if not callable(model_dump):
+            raise ProviderError(f"LiteLLM returned unsupported response type {type(response).__name__}")
+        data = model_dump(mode="json")
+        if not isinstance(data, dict):
+            raise ProviderError(f"LiteLLM returned unsupported response payload {type(data).__name__}")
+        return data
+
+
 def build_litellm_model(
     model_ref: str,
     *,
     timeout: int,
     max_tokens: int | None,
     effort: str | None,
-) -> OpenAIResponsesModel:
-    """Build the model adapter ThinHarness consumes while LiteLLM owns transport."""
+) -> OpenRouterModel:
+    """Build a full-history Chat Completions model while LiteLLM owns transport."""
     _, model = parse_model_ref(model_ref)
-    provider = LiteLLMResponsesProvider(model_ref, timeout=timeout)
+    provider = LiteLLMChatCompletionsProvider(model_ref, timeout=timeout)
     settings = ModelSettings(max_tokens=max_tokens, effort=effort)
-    return OpenAIResponsesModel(model, provider=provider, settings=settings)
+    return OpenRouterModel(model, provider=provider, settings=settings)

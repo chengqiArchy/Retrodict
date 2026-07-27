@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
 import pytest
+from thinharness import RequestConstants, ToolOutput
 from thinharness.providers import ProviderError
 
 from arc3 import litellm_provider
 from arc3.litellm_provider import (
+    LiteLLMChatCompletionsProvider,
     LiteLLMResponsesProvider,
     build_litellm_model,
     configure_litellm_instrumentation,
@@ -86,6 +89,106 @@ async def test_openrouter_responses_sets_endpoint_and_auth_header(monkeypatch: p
     assert captured["extra_headers"] == {"Authorization": "Bearer sk-or-v1-openrouter-test-key"}
 
 
+@pytest.mark.asyncio
+async def test_provider_routes_chat_completion_through_litellm(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_completion(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            model_dump=lambda **_: {
+                "choices": [{"message": {"role": "assistant", "content": "done"}}],
+            }
+        )
+
+    monkeypatch.setattr("litellm.completion", fake_completion)
+    provider = LiteLLMChatCompletionsProvider(
+        "openai:gpt-5.5",
+        api_key="test-key",
+        api_base="https://gateway.example/v1",
+        timeout=42,
+    )
+    messages = [{"role": "user", "content": "hello"}]
+
+    result = await provider.create_chat_completion(
+        {"model": "ignored", "messages": messages, "reasoning": {"effort": "high"}}
+    )
+
+    assert result["choices"][0]["message"]["content"] == "done"
+    assert captured == {
+        "model": "openai/gpt-5.5",
+        "messages": messages,
+        "reasoning_effort": "high",
+        "timeout": 42,
+        "api_key": "test-key",
+        "api_base": "https://gateway.example/v1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_tool_loop_sends_full_message_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fake_completion(**kwargs: object) -> object:
+        requests.append(copy.deepcopy(kwargs))
+        if len(requests) == 1:
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "python", "arguments": '{"code":"print(1)"}'},
+                    }
+                ],
+            }
+        else:
+            message = {"role": "assistant", "content": "done"}
+        return {"choices": [{"message": message}]}
+
+    monkeypatch.setattr("litellm.completion", fake_completion)
+    model = build_litellm_model("openai:gpt-5.5", timeout=30, max_tokens=512, effort="high")
+    session = model.new_session()
+    constants = RequestConstants(
+        instructions="Use tools.",
+        tools=[
+            {
+                "type": "function",
+                "name": "python",
+                "description": "Run Python.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"code": {"type": "string"}},
+                    "required": ["code"],
+                },
+            }
+        ],
+    )
+
+    first = await session.start("inspect", constants)
+    second = await session.continue_with_tools([ToolOutput(first.tool_calls[0].id, "1")], constants)
+
+    assert second.text == "done"
+    assert requests[1]["messages"] == [
+        {"role": "system", "content": "Use tools."},
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "python", "arguments": '{"code":"print(1)"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "1"},
+    ]
+    assert "previous_response_id" not in requests[1]
+
+
 def test_openai_model_uses_duck_shared_proxy_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LITELLM_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -95,7 +198,7 @@ def test_openai_model_uses_duck_shared_proxy_credentials(monkeypatch: pytest.Mon
     monkeypatch.delenv("LLM_MAIN_API_BASE", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "shared-proxy-test-key")
 
-    provider = LiteLLMResponsesProvider("openai:gpt-5.5")
+    provider = LiteLLMChatCompletionsProvider("openai:gpt-5.5")
 
     assert provider.api_key == "shared-proxy-test-key"
     assert provider.base_url == "http://localhost:8317/v1"
@@ -108,16 +211,16 @@ def test_duck_api_base_override_wins_over_local_default(monkeypatch: pytest.Monk
     monkeypatch.setenv("OPENROUTER_API_KEY", "shared-proxy-test-key")
     monkeypatch.setenv("LLM_MAIN_API_BASE", "https://proxy.example/v1")
 
-    provider = LiteLLMResponsesProvider("openai:gpt-5.5")
+    provider = LiteLLMChatCompletionsProvider("openai:gpt-5.5")
 
     assert provider.base_url == "https://proxy.example/v1"
 
 
-def test_build_model_preserves_thinharness_responses_semantics() -> None:
+def test_build_model_uses_full_history_chat_completions() -> None:
     model = build_litellm_model("openai:gpt-5.5", timeout=30, max_tokens=8192, effort="high")
 
     assert model.model == "gpt-5.5"
-    assert isinstance(model.provider, LiteLLMResponsesProvider)
+    assert isinstance(model.provider, LiteLLMChatCompletionsProvider)
     assert model.provider.model_name == "openai/gpt-5.5"
     assert model.settings.max_tokens == 8192
     assert model.settings.effort == "high"
@@ -131,10 +234,10 @@ async def test_provider_maps_litellm_errors_to_harness_errors(monkeypatch: pytes
     def fail(**_: object) -> object:
         raise FakeLiteLLMError("rate limited")
 
-    monkeypatch.setattr("litellm.responses", fail)
-    provider = LiteLLMResponsesProvider("openai:gpt-5.5")
+    monkeypatch.setattr("litellm.completion", fail)
+    provider = LiteLLMChatCompletionsProvider("openai:gpt-5.5")
 
     with pytest.raises(ProviderError, match="LiteLLM request failed: rate limited") as caught:
-        await provider.create_response({"input": "hello"})
+        await provider.create_chat_completion({"messages": [{"role": "user", "content": "hello"}]})
 
     assert caught.value.status_code == 429
