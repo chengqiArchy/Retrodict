@@ -76,6 +76,7 @@ class RunnerConfig:
 
     game_id: str
     target_level_index: int = 0
+    stop_after_target_level: bool = False
     model: str = "openai:gpt-5.5"
     reasoning_effort: str | None = "high"
     max_output_tokens: int = 32_768
@@ -302,7 +303,7 @@ class GameRunner:
         return self.tracer.start_as_current_span(name, attributes=clean)
 
     async def run(self) -> dict[str, Any]:
-        """Play until WIN, a cap, or a failure; return (and write) metrics."""
+        """Play until the configured target, WIN, a cap, or a failure."""
         from thinharness import HarnessError
 
         started = time.time()
@@ -476,7 +477,7 @@ class GameRunner:
                 if turn_span is not None:
                     turn_span.set_attribute("retrodict.turn.outcome", reason)
                     turn_span.set_attribute("retrodict.actions_after", self.state.actions_taken)
-            if reason in {"win", "action_cap", "env_error"}:
+            if reason in {"current_level_complete", "win", "action_cap", "env_error"}:
                 return reason
 
     # -- agent invocation ---------------------------------------------------
@@ -671,7 +672,7 @@ class GameRunner:
                 outcome = self._reset_after_game_over()
             elif frame.levels_completed != prev_levels:
                 self._start_level()
-                outcome = "level_change"
+                outcome = "current_level_complete" if self.cfg.stop_after_target_level else "level_change"
             elif frame.state != prev_state:
                 outcome = "state_change"
             else:
@@ -783,6 +784,9 @@ class GameRunner:
         state = self.state
         return {
             "game_id": self.cfg.game_id,
+            "target_level_index": self.cfg.target_level_index,
+            "target_level_solved": self.cfg.stop_after_target_level
+            and stop_reason in {"current_level_complete", "win"},
             "model": self.cfg.model,
             "reasoning_effort": self.cfg.reasoning_effort,
             "image_prime": self.cfg.image_prime,
@@ -1045,6 +1049,11 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run the RGB-style ARC-AGI-3 agent on one game.")
     parser.add_argument("game_id", help="e.g. ls20 or ls20-9607627b")
     parser.add_argument("--target-level-index", type=int, default=0, help="zero-based local level to start from")
+    parser.add_argument(
+        "--stop-after-target-level",
+        action="store_true",
+        help="stop successfully as soon as the selected starting level is completed",
+    )
     parser.add_argument("--model", default="openai:gpt-5.5")
     parser.add_argument("--effort", default="high", help="reasoning effort; 'none' disables the reasoning field")
     parser.add_argument("--mode", default="normal", choices=["normal", "offline", "online"], help="arc-agi operation mode")
@@ -1059,6 +1068,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg = RunnerConfig(
         game_id=args.game_id,
         target_level_index=args.target_level_index,
+        stop_after_target_level=args.stop_after_target_level,
         model=args.model,
         reasoning_effort=None if args.effort == "none" else args.effort,
         action_cap=args.action_cap,

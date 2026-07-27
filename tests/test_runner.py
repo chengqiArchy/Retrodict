@@ -251,6 +251,38 @@ async def test_level_change_interrupts_the_queue(tmp_path: Path) -> None:
     assert "level counter changed" in agent.calls[1].prompt
 
 
+async def test_larc_target_level_completion_stops_without_entering_next_level(tmp_path: Path) -> None:
+    env = FakeEnv([make_frame()], [make_frame(levels=1), make_frame(state=GameState.WIN, levels=7)])
+    agent = FakeAgent([reply(plan_text("ACTION1", "ACTION2"))])
+    runner = make_runner(
+        tmp_path,
+        env,
+        agent,
+        target_level_index=2,
+        stop_after_target_level=True,
+    )
+
+    metrics = await runner.run()
+
+    assert metrics["stop_reason"] == "current_level_complete"
+    assert metrics["target_level_index"] == 2
+    assert metrics["target_level_solved"] is True
+    assert metrics["state"] == "NOT_FINISHED"
+    assert [call.action for call in env.steps] == ["ACTION1"]
+    assert len(agent.calls) == 1
+
+
+async def test_larc_final_target_level_win_is_marked_solved(tmp_path: Path) -> None:
+    env = FakeEnv([make_frame()], [make_frame(state=GameState.WIN, levels=7)])
+    agent = FakeAgent([reply(plan_text("ACTION1"))])
+    runner = make_runner(tmp_path, env, agent, stop_after_target_level=True)
+
+    metrics = await runner.run()
+
+    assert metrics["stop_reason"] == "win"
+    assert metrics["target_level_solved"] is True
+
+
 async def test_state_change_interrupts_the_queue(tmp_path: Path) -> None:
     env = FakeEnv([make_frame()], [make_frame(state=GameState.NOT_PLAYED), make_frame(state=GameState.WIN, levels=7)])
     agent = FakeAgent([reply(plan_text("ACTION1", "ACTION2")), reply(plan_text("ACTION3"))])
