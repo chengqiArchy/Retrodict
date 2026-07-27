@@ -141,6 +141,8 @@ class ThinAgentClient:
     ) -> None:
         from thinharness import Harness, HarnessConfig, TracingOptions, create_otlp_tracing
 
+        from .litellm_provider import build_litellm_model
+
         self.logfire_tracing = logfire_tracing
         self._owns_logfire_tracing = False
         remote_tracing = []
@@ -188,7 +190,13 @@ class ThinAgentClient:
             local_trace_dir=trace_dir,
             tracing=remote_tracing,
         )
-        self.harness = Harness(config, tools=[PythonTool(workspace, analysis_python).spec()])
+        model = build_litellm_model(
+            cfg.model,
+            timeout=cfg.request_timeout,
+            max_tokens=cfg.max_output_tokens,
+            effort=cfg.reasoning_effort,
+        )
+        self.harness = Harness(config, model=model, tools=[PythonTool(workspace, analysis_python).spec()])
 
     async def invoke(self, prompt: str, resume_from: dict[str, Any] | None) -> AgentReply:
         result = await self.harness.run(prompt, resume_from=resume_from)

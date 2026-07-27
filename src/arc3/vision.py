@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import base64
 import io
-import os
+from typing import Any, cast
+
+from .litellm_provider import LiteLLMResponsesProvider
 
 # ARC-AGI-3 16-colour palette (matches the run-inspector viewer).
 PALETTE = [
@@ -42,15 +44,24 @@ def render_board_png(board: list[list[int]], *, cell: int = 12) -> bytes:
 
 
 def describe_opening(board: list[list[int]], *, model: str = "gpt-5.5", api_key: str | None = None) -> tuple[str, bytes]:
-    """Render the board and ask an OpenAI vision model to describe it. Returns (description, png_bytes)."""
-    from openai import OpenAI
+    """Render the board and ask a vision model through LiteLLM. Returns (description, png_bytes)."""
+    from litellm import responses
 
     png = render_board_png(board)
     b64 = base64.b64encode(png).decode()
-    client = OpenAI(api_key=api_key or os.environ["OPENAI_API_KEY"])
     content = [
         {"type": "input_text", "text": PROMPT},
         {"type": "input_image", "image_url": f"data:image/png;base64,{b64}"},
     ]
-    resp = client.responses.create(model=model, input=[{"role": "user", "content": content}])  # type: ignore[arg-type]
+    model_ref = model if ":" in model else f"openai:{model}"
+    provider = LiteLLMResponsesProvider(model_ref, api_key=api_key)
+    resp = cast(
+        Any,
+        responses(
+            model=provider.model_name,
+            input=cast(Any, [{"role": "user", "content": content}]),
+            api_key=provider.api_key,
+            api_base=provider.base_url or None,
+        ),
+    )
     return resp.output_text.strip(), png

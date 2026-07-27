@@ -7,7 +7,7 @@ dependencies = [
     "arc-agi",
     "thinharness[tracing]",
     "pydantic>=2",
-    "openai>=2.44.0",
+    "litellm>=1.80.0",
     "numpy>=2",
 ]
 

@@ -74,7 +74,10 @@ uv sync
 ./scripts/setup_analysis_venv.sh   # containment venv the agent's python tool runs in
 ```
 
-`OPENAI_API_KEY` is required (in `../thinharness/.env`). Games download into `environment_files/` on first use and run locally in-process.
+Model requests, including the optional image-prime request, use the LiteLLM Python SDK. CLI model references keep the
+`provider:model` spelling and are translated to LiteLLM provider paths internally. Set the provider key such as
+`OPENAI_API_KEY`, or use `LITELLM_API_KEY` with `LITELLM_BASE_URL` for a shared gateway (the example dotenv remains
+`../thinharness/.env`). Games download into `environment_files/` on first use and run locally in-process.
 
 ```bash
 uv run --env-file ../thinharness/.env arc3-run <game> --model openai:gpt-5.6-sol --effort max --cost-cap 20 --image-prime

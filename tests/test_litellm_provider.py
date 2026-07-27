@@ -1,0 +1,68 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+from thinharness.providers import ProviderError
+
+from arc3.litellm_provider import LiteLLMResponsesProvider, build_litellm_model, litellm_model_name
+
+
+def test_litellm_model_name_translates_harness_provider_separator() -> None:
+    assert litellm_model_name("openai:gpt-5.5") == "openai/gpt-5.5"
+    assert litellm_model_name("openrouter:moonshotai/kimi-k2.6") == "openrouter/moonshotai/kimi-k2.6"
+
+
+@pytest.mark.asyncio
+async def test_provider_routes_responses_payload_through_litellm(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_aresponses(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(model_dump=lambda **_: {"id": "resp_1", "output": []})
+
+    monkeypatch.setattr("litellm.aresponses", fake_aresponses)
+    provider = LiteLLMResponsesProvider(
+        "openai:gpt-5.5",
+        api_key="test-key",
+        api_base="https://gateway.example/v1",
+        timeout=42,
+    )
+
+    result = await provider.create_response({"model": "ignored", "input": "hello"})
+
+    assert result == {"id": "resp_1", "output": []}
+    assert captured == {
+        "model": "openai/gpt-5.5",
+        "input": "hello",
+        "timeout": 42,
+        "api_key": "test-key",
+        "api_base": "https://gateway.example/v1",
+    }
+
+
+def test_build_model_preserves_thinharness_responses_semantics() -> None:
+    model = build_litellm_model("openai:gpt-5.5", timeout=30, max_tokens=8192, effort="high")
+
+    assert model.model == "gpt-5.5"
+    assert isinstance(model.provider, LiteLLMResponsesProvider)
+    assert model.provider.model_name == "openai/gpt-5.5"
+    assert model.settings.max_tokens == 8192
+    assert model.settings.effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_provider_maps_litellm_errors_to_harness_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeLiteLLMError(Exception):
+        status_code = 429
+
+    async def fail(**_: object) -> object:
+        raise FakeLiteLLMError("rate limited")
+
+    monkeypatch.setattr("litellm.aresponses", fail)
+    provider = LiteLLMResponsesProvider("openai:gpt-5.5")
+
+    with pytest.raises(ProviderError, match="LiteLLM request failed: rate limited") as caught:
+        await provider.create_response({"input": "hello"})
+
+    assert caught.value.status_code == 429
