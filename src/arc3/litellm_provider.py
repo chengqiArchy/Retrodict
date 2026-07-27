@@ -36,12 +36,15 @@ class LiteLLMResponsesProvider(OpenAIProvider):
         api_base: str | None = None,
         timeout: int = 120,
     ) -> None:
+        provider_name, _ = parse_model_ref(model_ref)
+        default_base_url = "https://openrouter.ai/api/v1" if provider_name == "openrouter" else ""
         Provider.__init__(
             self,
             api_key=api_key or _provider_setting(model_ref, "API_KEY"),
-            base_url=api_base or _provider_setting(model_ref, "BASE_URL") or "",
+            base_url=api_base or _provider_setting(model_ref, "BASE_URL") or default_base_url,
             timeout=timeout,
         )
+        self.provider_name = provider_name
         self.model_name = litellm_model_name(model_ref)
 
     async def create_response(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -51,6 +54,8 @@ class LiteLLMResponsesProvider(OpenAIProvider):
         request = {**payload, "model": self.model_name, "timeout": self.timeout}
         if self.api_key:
             request["api_key"] = self.api_key
+            if self.provider_name == "openrouter":
+                request["extra_headers"] = {"Authorization": f"Bearer {self.api_key}"}
         if self.base_url:
             request["api_base"] = self.base_url
         try:

@@ -41,6 +41,25 @@ async def test_provider_routes_responses_payload_through_litellm(monkeypatch: py
     }
 
 
+@pytest.mark.asyncio
+async def test_openrouter_responses_sets_endpoint_and_auth_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_aresponses(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return {"id": "resp_1", "output": []}
+
+    monkeypatch.setattr("litellm.aresponses", fake_aresponses)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-test-key")
+    provider = LiteLLMResponsesProvider("openrouter:openai/gpt-5.5")
+
+    await provider.create_response({"input": "hello"})
+
+    assert captured["model"] == "openrouter/openai/gpt-5.5"
+    assert captured["api_base"] == "https://openrouter.ai/api/v1"
+    assert captured["extra_headers"] == {"Authorization": "Bearer openrouter-test-key"}
+
+
 def test_build_model_preserves_thinharness_responses_semantics() -> None:
     model = build_litellm_model("openai:gpt-5.5", timeout=30, max_tokens=8192, effort="high")
 
